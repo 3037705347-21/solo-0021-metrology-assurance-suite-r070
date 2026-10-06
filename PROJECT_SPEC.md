@@ -29,6 +29,10 @@ external service.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
 - AuditEvent: an append-only trace of meaningful case and device changes.
+- CaseTransition: one effective case state transition with a case-scoped,
+  gap-free sequence, the business state and version before and after the
+  transition, the acting operator, the action-specific basis (measurement,
+  reopen reason, or seal), and a link to its audit event.
 
 ## Workflows
 
@@ -88,8 +92,18 @@ Required invariants:
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
 - A sealed case cannot accept measurements, reopen, or seal again.
-- Every mutation that changes a case also appends an audit event in the same
-  repository commit.
+- Every mutation that changes a case also appends an audit event and a case
+  transition in the same repository commit.
+- Only a committed transition exists: a failed or rolled-back request appends
+  neither an event nor a step and leaves no sequence gap.
+- Transitions are ordered solely by their case-scoped sequence (1, 2, 3, ...),
+  which is gap-free, so later events never rearrange earlier history.
+- Each transition records the source and target business state and version;
+  consecutive steps link target-to-source and the final step must equal the
+  stored case state and version. The read side verifies this chain before
+  serving the timeline.
+- The case detail and the events endpoints build the timeline through one
+  shared function, so both entry points always describe the same facts.
 
 ## Modules
 
@@ -123,6 +137,9 @@ both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
 seal.
 
-Tests are intentionally deferred for this initialization baseline. The later
-engineering-task stage will add unit and integration tests, including red/green
-verification for the workflows and their failure paths.
+The engineering task stage adds unit and integration tests under `go test
+./...`, covering the state machine, timeline chain verification (gaps, broken
+links, head mismatch), copy-on-write rollback that discards steps and
+sequence numbers, failed requests producing no steps, later events never
+rearranging earlier steps, concurrent seals producing exactly one timeline
+step, and identical timeline output across the case and events entry points.

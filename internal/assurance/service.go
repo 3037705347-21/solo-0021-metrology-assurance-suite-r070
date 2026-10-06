@@ -105,22 +105,41 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if err := m.PutCase(item); err != nil {
 			return err
 		}
+		at := s.now()
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
 			item.ID,
 			item.ID,
-			"case_opened",
+			string(domain.CaseActionOpened),
 			item.Steward,
 			"verification case opened",
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		opening, err := domain.NewCaseTransition(
+			m.NextTransitionSequence(item.ID),
+			item.ID,
+			domain.CaseActionOpened,
+			item.Steward,
+			nil,
+			item.State,
+			0,
+			item.Version,
+			domain.TransitionBasis{AuditEventID: event.ID},
+			at,
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendTransition(opening); err != nil {
+			return err
+		}
+		result, err = caseResponse(m, item)
+		return err
 	})
 	return result, err
 }
@@ -132,7 +151,11 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		result = caseResponseFromSnapshot(snapshot, item)
+		view, err := caseResponseFromSnapshot(snapshot, item)
+		if err != nil {
+			return err
+		}
+		result = view
 		return nil
 	})
 	return result, err
@@ -146,6 +169,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		at := s.now()
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -153,12 +177,14 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			item.Nominal,
 			item.Tolerance,
 			input.Technician,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
-		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
+		fromState := item.State
+		fromVersion := item.Version
+		if err := item.RecordMeasurement(measurement.Accepted, at); err != nil {
 			return err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
@@ -167,10 +193,10 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
-		kind := "measurement_rejected"
+		action := domain.CaseActionRejected
 		detail := "measurement exceeded tolerance and requires another measurement"
 		if measurement.Accepted {
-			kind = "measurement_accepted"
+			action = domain.CaseActionAccepted
 			detail = "measurement is within tolerance and ready for review"
 		}
 		event, err := domain.NewAuditEvent(
@@ -178,17 +204,42 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			"case",
 			item.ID,
 			item.ID,
-			kind,
+			string(action),
 			measurement.Technician,
 			detail,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		accepted := measurement.Accepted
+		transition, err := domain.NewCaseTransition(
+			m.NextTransitionSequence(item.ID),
+			item.ID,
+			action,
+			measurement.Technician,
+			&fromState,
+			item.State,
+			fromVersion,
+			item.Version,
+			domain.TransitionBasis{
+				MeasurementID: measurement.ID,
+				Observed:      &measurement.Observed,
+				Deviation:     &measurement.Deviation,
+				Accepted:      &accepted,
+				AuditEventID:  event.ID,
+			},
+			at,
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendTransition(transition); err != nil {
+			return err
+		}
+		result, err = caseResponse(m, item)
+		return err
 	})
 	return result, err
 }
@@ -201,33 +252,57 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if err := item.Reopen(s.now()); err != nil {
-			return err
-		}
-		if err := m.UpdateCase(item); err != nil {
-			return err
-		}
 		actor := strings.TrimSpace(input.Actor)
 		reason := strings.TrimSpace(input.Reason)
 		if actor == "" || reason == "" {
 			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+		}
+		at := s.now()
+		fromState := item.State
+		fromVersion := item.Version
+		if err := item.Reopen(at); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
 			item.ID,
 			item.ID,
-			"case_reopened",
+			string(domain.CaseActionReopened),
 			actor,
 			reason,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		transition, err := domain.NewCaseTransition(
+			m.NextTransitionSequence(item.ID),
+			item.ID,
+			domain.CaseActionReopened,
+			actor,
+			&fromState,
+			item.State,
+			fromVersion,
+			item.Version,
+			domain.TransitionBasis{
+				Reason:       reason,
+				AuditEventID: event.ID,
+			},
+			at,
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendTransition(transition); err != nil {
+			return err
+		}
+		result, err = caseResponse(m, item)
+		return err
 	})
 	return result, err
 }
@@ -247,9 +322,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
-		if err := item.Seal(s.now()); err != nil {
-			return err
-		}
+		at := s.now()
 		seal, err := domain.NewEvidenceSeal(
 			m.NextID("seal"),
 			item.ID,
@@ -257,9 +330,14 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
-			s.now(),
+			at,
 		)
 		if err != nil {
+			return err
+		}
+		fromState := item.State
+		fromVersion := item.Version
+		if err := item.Seal(at); err != nil {
 			return err
 		}
 		if err := m.PutSeal(seal); err != nil {
@@ -273,17 +351,44 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			"case",
 			item.ID,
 			item.ID,
-			"case_sealed",
+			string(domain.CaseActionSealed),
 			seal.Reviewer,
 			seal.Summary,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		accepted := true
+		transition, err := domain.NewCaseTransition(
+			m.NextTransitionSequence(item.ID),
+			item.ID,
+			domain.CaseActionSealed,
+			seal.Reviewer,
+			&fromState,
+			item.State,
+			fromVersion,
+			item.Version,
+			domain.TransitionBasis{
+				MeasurementID: seal.MeasurementID,
+				Observed:      &measurement.Observed,
+				Deviation:     &measurement.Deviation,
+				Accepted:      &accepted,
+				SealID:        seal.ID,
+				Summary:       seal.Summary,
+				AuditEventID:  event.ID,
+			},
+			at,
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendTransition(transition); err != nil {
+			return err
+		}
+		result, err = caseResponse(m, item)
+		return err
 	})
 	return result, err
 }
@@ -303,26 +408,42 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 	return selected, found
 }
 
-func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
+// timelineFor is the single place that assures the review-facing timeline, so
+// every HTTP entry point reports identical state, version, and linkage facts.
+func timelineFor(transitions []domain.CaseTransition, item domain.VerificationCase) (domain.CaseTimeline, error) {
+	return domain.BuildCaseTimeline(item, transitions)
+}
+
+func caseResponse(m *repository.Mutation, item domain.VerificationCase) (contracts.CaseResponse, error) {
+	timeline, err := timelineFor(m.Transitions(item.ID), item)
+	if err != nil {
+		return contracts.CaseResponse{}, err
+	}
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: m.Measurements(item.ID),
 		Events:       m.Events(item.ID),
+		Timeline:     timeline,
 	}
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
-	return result
+	return result, nil
 }
 
-func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
+func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) (contracts.CaseResponse, error) {
+	timeline, err := timelineFor(snapshot.Transitions(item.ID), item)
+	if err != nil {
+		return contracts.CaseResponse{}, err
+	}
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: snapshot.Measurements(item.ID),
 		Events:       snapshot.Events(item.ID),
+		Timeline:     timeline,
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal
 	}
-	return result
+	return result, nil
 }

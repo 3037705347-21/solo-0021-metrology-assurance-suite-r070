@@ -9,6 +9,10 @@ var (
 	ErrActiveCaseExists   = errors.New("device already has an unfinished case")
 	ErrStateConflict      = errors.New("resource state conflict")
 	ErrSealAlreadyCreated = errors.New("case already has an evidence seal")
+	// ErrTimelineCorrupt means committed transitions no longer form a
+	// continuous chain ending at the stored case. It can only arise from a
+	// persistence integrity failure, never from client input.
+	ErrTimelineCorrupt = errors.New("case timeline is corrupt")
 )
 
 func IsKnownError(err error) bool {
@@ -17,5 +21,6 @@ func IsKnownError(err error) bool {
 		errors.Is(err, ErrDuplicateAssetTag) ||
 		errors.Is(err, ErrActiveCaseExists) ||
 		errors.Is(err, ErrStateConflict) ||
-		errors.Is(err, ErrSealAlreadyCreated)
+		errors.Is(err, ErrSealAlreadyCreated) ||
+		errors.Is(err, ErrTimelineCorrupt)
 }

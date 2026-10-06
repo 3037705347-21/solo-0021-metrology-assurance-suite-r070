@@ -104,5 +104,10 @@ func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, contracts.EventsResponse{Events: view.Events})
+	// The timeline is built through the same path as the case detail, so the
+	// events entry point and the case entry point explain identical facts.
+	writeJSON(writer, http.StatusOK, contracts.EventsResponse{
+		Events:   view.Events,
+		Timeline: view.Timeline,
+	})
 }

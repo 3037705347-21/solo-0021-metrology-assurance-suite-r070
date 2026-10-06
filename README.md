@@ -13,24 +13,6 @@ go run ./cmd/metrology-service --addr 127.0.0.1:18121
 
 The service listens on `127.0.0.1:18121` by default.
 
-## Build And Verify
-
-```bash
-go build ./...
-go run ./cmd/workflowcheck --workflow register-device
-go run ./cmd/workflowcheck --workflow open-verification-case
-go run ./cmd/workflowcheck --workflow record-measurement
-go run ./cmd/workflowcheck --workflow reopen-verification-case
-go run ./cmd/workflowcheck --workflow seal-verification
-```
-
-The workflow runner starts a fresh in-process HTTP service and exercises the
-public API. It is a production smoke command, not a unit test.
-
-Tests are intentionally deferred for this initialization baseline. The later
-engineering-task stage will add the unit and integration test suite and replace
-or extend these smoke checks with red/green verification tests.
-
 ## API
 
 - `GET /healthz`
@@ -42,6 +24,45 @@ or extend these smoke checks with red/green verification tests.
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
+
+### State timeline
+
+Both `GET /cases/{id}` and `GET /cases/{id}/events` return a verified
+`timeline` for the case. Every committed transition appears as one ordered
+step with:
+
+- `sequence`: case-scoped, gap-free position (1, 2, 3, ...), the only ordering
+  key, so new events never rearrange earlier history.
+- `action` and `actor`: the workflow action (`case_opened`,
+  `measurement_accepted`, `measurement_rejected`, `case_reopened`,
+  `case_sealed`) and the operator who drove it.
+- `from_state`/`to_state` and `from_version`/`to_version`: the business state
+  and version before and after the transition; consecutive steps link together
+  and the last step equals the stored case.
+- `basis`: the action-specific evidence — measurement id/observed/deviation/
+  accepted decision for measurement steps, reopen reason, or seal id/summary —
+  plus the linked `audit_event_id`.
+- `occurred_at`: the committed transition time.
+
+Failed or rolled-back requests never append a step (and leave no sequence
+gap); the read side rejects any timeline whose chain does not end at the
+current case instead of serving a misleading history.
+
+## Build And Verify
+
+```bash
+go build ./...
+go test ./...
+go run ./cmd/workflowcheck --workflow register-device
+go run ./cmd/workflowcheck --workflow open-verification-case
+go run ./cmd/workflowcheck --workflow record-measurement
+go run ./cmd/workflowcheck --workflow reopen-verification-case
+go run ./cmd/workflowcheck --workflow seal-verification
+```
+
+The workflow runner starts a fresh in-process HTTP service and exercises the
+public API. It is a production smoke command, complementing the unit and
+integration test suite in `go test ./...`.
 
 ## Layout
 

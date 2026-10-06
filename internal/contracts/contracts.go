@@ -40,10 +40,15 @@ type CaseResponse struct {
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`
+	// Timeline is the verified state-transition history for the case. It is
+	// built from the same committed records by the case and events entry
+	// points, so both describe identical facts.
+	Timeline domain.CaseTimeline `json:"timeline"`
 }
 
 type EventsResponse struct {
-	Events []domain.AuditEvent `json:"events"`
+	Events   []domain.AuditEvent `json:"events"`
+	Timeline domain.CaseTimeline `json:"timeline"`
 }
 
 type ErrorResponse struct {

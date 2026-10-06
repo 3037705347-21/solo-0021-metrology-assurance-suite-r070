@@ -15,6 +15,7 @@ type Repository struct {
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
+	transitions  map[string][]domain.CaseTransition
 	counters     map[string]int
 }
 
@@ -24,6 +25,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		transitions:  make(map[string][]domain.CaseTransition),
 		counters:     make(map[string]int),
 	}
 }
@@ -34,6 +36,7 @@ type Snapshot struct {
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
+	transitions  map[string][]domain.CaseTransition
 }
 
 func (s Snapshot) Device(id string) (domain.Device, bool) {
@@ -74,6 +77,12 @@ func (s Snapshot) Events(caseID string) []domain.AuditEvent {
 	return result
 }
 
+// Transitions returns the committed transitions of one case in their stable,
+// case-scoped sequence order.
+func (s Snapshot) Transitions(caseID string) []domain.CaseTransition {
+	return append([]domain.CaseTransition(nil), s.transitions[caseID]...)
+}
+
 func (s Snapshot) AllDevices() []domain.Device {
 	result := make([]domain.Device, 0, len(s.devices))
 	for _, item := range s.devices {
@@ -96,6 +105,7 @@ type Mutation struct {
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
+	transitions  map[string][]domain.CaseTransition
 	counters     map[string]int
 }
 
@@ -203,6 +213,30 @@ func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	return result
 }
 
+// NextTransitionSequence returns the next case-scoped transition number. The
+// sequence counter lives in the copy-on-write mutation, so a callback that
+// later fails discards the numbering along with every other change: rolled-back
+// requests leave no gaps and no steps.
+func (m *Mutation) NextTransitionSequence(caseID string) int {
+	return len(m.transitions[caseID]) + 1
+}
+
+func (m *Mutation) AppendTransition(item domain.CaseTransition) error {
+	if _, exists := m.cases[item.CaseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
+	}
+	existing := m.transitions[item.CaseID]
+	if item.Sequence != len(existing)+1 {
+		return fmt.Errorf("%w: case %s transition sequence out of order", domain.ErrStateConflict, item.CaseID)
+	}
+	m.transitions[item.CaseID] = append(existing, item)
+	return nil
+}
+
+func (m *Mutation) Transitions(caseID string) []domain.CaseTransition {
+	return append([]domain.CaseTransition(nil), m.transitions[caseID]...)
+}
+
 func (r *Repository) Read(ctx context.Context, fn func(Snapshot) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -225,6 +259,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
+		transitions:  cloneTransitions(r.transitions),
 		counters:     cloneCounters(r.counters),
 	}
 	if err := fn(next); err != nil {
@@ -235,6 +270,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.measurements = next.measurements
 	r.seals = next.seals
 	r.events = next.events
+	r.transitions = next.transitions
 	r.counters = next.counters
 	return nil
 }
@@ -246,6 +282,7 @@ func (r *Repository) snapshot() Snapshot {
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
+		transitions:  cloneTransitions(r.transitions),
 	}
 }
 
@@ -277,6 +314,14 @@ func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.Evidenc
 	result := make(map[string]domain.EvidenceSeal, len(values))
 	for key, value := range values {
 		result[key] = value
+	}
+	return result
+}
+
+func cloneTransitions(values map[string][]domain.CaseTransition) map[string][]domain.CaseTransition {
+	result := make(map[string][]domain.CaseTransition, len(values))
+	for key, value := range values {
+		result[key] = append([]domain.CaseTransition(nil), value...)
 	}
 	return result
 }
