@@ -40,10 +40,21 @@ type CaseResponse struct {
 	Measurements []domain.Measurement    `json:"measurements"`
 	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
 	Events       []domain.AuditEvent     `json:"events"`
+	// Timeline is the deterministic, reviewable state-transition projection.
+	// It is computed from the same snapshot as Case and Events, so the case
+	// detail and the events endpoint can never describe different facts.
+	Timeline []domain.TimelineStep `json:"timeline"`
 }
 
-type EventsResponse struct {
-	Events []domain.AuditEvent `json:"events"`
+// TimelineResponse is the events endpoint view. It keeps the raw append-order
+// events for compatibility and adds the case header and the projected
+// timeline, letting a reviewer anchor every step to the current case version.
+type TimelineResponse struct {
+	CaseID   string                `json:"case_id"`
+	State    domain.CaseState      `json:"state"`
+	Version  int                   `json:"version"`
+	Events   []domain.AuditEvent   `json:"events"`
+	Timeline []domain.TimelineStep `json:"timeline"`
 }
 
 type ErrorResponse struct {

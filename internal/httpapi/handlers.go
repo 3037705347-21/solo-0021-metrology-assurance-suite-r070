@@ -99,10 +99,10 @@ func (s *Server) sealCase(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) events(writer http.ResponseWriter, request *http.Request) {
-	view, err := s.service.Case(request.Context(), request.PathValue("id"))
+	view, err := s.service.CaseTimeline(request.Context(), request.PathValue("id"))
 	if err != nil {
 		writeError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, contracts.EventsResponse{Events: view.Events})
+	writeJSON(writer, http.StatusOK, view)
 }

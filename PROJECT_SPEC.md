@@ -28,7 +28,12 @@ external service.
   technician, and timestamp.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
-- AuditEvent: an append-only trace of meaningful case and device changes.
+- AuditEvent: an append-only trace of meaningful case and device changes. Case
+  events certify one effective state transition and record the actor, basis,
+  evidence reference, and the before/after state and version. Every event
+  carries a repository-wide append sequence.
+- TimelineStep: a reviewable projection of the case transition events, ordered
+  by append sequence with dense case-local step numbers.
 
 ## Workflows
 
@@ -65,6 +70,25 @@ The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 measurement with the smallest absolute deviation, creates exactly one evidence
 seal, moves the case to `sealed`, and rejects later mutations.
 
+### 6. Read Case State Timeline
+
+A duty officer or reviewer sends `GET /cases/{id}/events`. The service reads
+the case and its events in one snapshot and projects a deterministic timeline:
+
+- Only committed, legal case state transitions become steps. Requests that
+  fail validation or the state guard are rolled back by the copy-on-write
+  commit and can never create an event or a step.
+- Steps are ordered by the event's repository-wide append sequence, never by
+  timestamp or input slice order. Appending new events never reorders earlier
+  steps; the case-local step numbers are dense and stable.
+- Each step shows the action, actor, basis (reason or decision summary),
+  evidence reference (measurement or evidence seal), and the before/after
+  state and version. Steps are chain-linked: one step's result is the next
+  step's starting point, beginning with `case_opened` at version 1.
+- The final step must land exactly on the case's current state and version.
+  `GET /cases/{id}` embeds the identical projection from the same read rules,
+  so the case detail and the events entry always describe the same facts.
+
 ## State And Rules
 
 Device state:
@@ -90,6 +114,13 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- Every case audit event certifies one legal transition: it records the exact
+  before/after state and version (version advances by one), the actor, the
+  basis, and—for measurement and seal transitions—the referenced evidence id.
+- Case timelines are ordered by the event append sequence; later commits
+  cannot reorder or rewrite earlier steps.
+- The projected timeline's final state and version must equal the stored case;
+  any divergence is reported as an integrity error, not silently repaired.
 
 ## Modules
 
@@ -97,7 +128,8 @@ Required invariants:
 - `cmd/workflowcheck`: bounded smoke checks that call the public HTTP API.
 - `internal/httpapi`: routing, request decoding, and stable error mapping.
 - `internal/assurance`: workflow orchestration and atomic decisions.
-- `internal/domain`: entities, validation, state transitions, and errors.
+- `internal/domain`: entities, validation, state transitions, timeline
+  projection, and errors.
 - `internal/repository`: mutex-protected in-memory persistence with copy-on-write
   commits.
 - `internal/contracts`: request and response contracts shared by the HTTP layer.
@@ -112,17 +144,19 @@ Required invariants:
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
-- `GET /cases/{id}/events`
+- `GET /cases/{id}/events` — returns the case header, raw append-order events,
+  and the ordered state-transition timeline.
+- `GET /cases/{id}` — case detail includes the same timeline projection.
 
 ## Validation Plan
 
-The baseline build command is `go build ./...`. Each declared workflow has a
-bounded production smoke command under `cmd/workflowcheck`. The command starts
-an HTTP test server in the same process, calls the public routes, and verifies
-both success and failure behavior. The seal check also races two concurrent
-seal requests to prove that the repository mutation lock permits exactly one
-seal.
-
-Tests are intentionally deferred for this initialization baseline. The later
-engineering-task stage will add unit and integration tests, including red/green
-verification for the workflows and their failure paths.
+The baseline build command is `go build ./...`; unit tests run with
+`go test ./...` (timeline projection and transition-event validation). Each
+declared workflow has a bounded production smoke command under
+`cmd/workflowcheck`. The command starts an HTTP test server in the same
+process, calls the public routes, and verifies both success and failure
+behavior. The seal check also races two concurrent seal requests to prove that
+the repository mutation lock permits exactly one seal. The timeline check
+drives the full reject/reopen/accept/seal lifecycle with interspersed failed
+requests, a concurrent seal, and a second read to prove failed requests add no
+steps, history does not reorder, and the case detail and events entries agree.

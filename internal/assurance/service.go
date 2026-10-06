@@ -91,13 +91,14 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
 			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
 		}
+		at := s.now()
 		item, err := domain.NewVerificationCase(
 			m.NextID("case"),
 			device.ID,
 			input.Nominal,
 			input.Tolerance,
 			input.Steward,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
@@ -105,22 +106,25 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if err := m.PutCase(item); err != nil {
 			return err
 		}
-		event, err := domain.NewAuditEvent(
+		event, err := domain.NewCaseTransitionEvent(
 			m.NextID("event"),
-			"case",
 			item.ID,
-			item.ID,
-			"case_opened",
+			domain.EventCaseOpened,
 			item.Steward,
 			"verification case opened",
-			s.now(),
+			"",
+			item.State,
+			0,
+			item.Version,
+			"",
+			"",
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return buildCaseView(m, item, &result)
 	})
 	return result, err
 }
@@ -132,7 +136,34 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		result = caseResponseFromSnapshot(snapshot, item)
+		return buildCaseView(snapshot, item, &result)
+	})
+	return result, err
+}
+
+// CaseTimeline backs GET /cases/{id}/events. It reads the case and its events
+// in one snapshot and projects the timeline there, so the response cannot
+// diverge from GET /cases/{id}.
+func (s *Service) CaseTimeline(ctx context.Context, id string) (contracts.TimelineResponse, error) {
+	var result contracts.TimelineResponse
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		caseID := strings.TrimSpace(id)
+		item, exists := snapshot.Case(caseID)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		events := snapshot.Events(item.ID)
+		timeline, err := domain.BuildCaseTimeline(item, events)
+		if err != nil {
+			return err
+		}
+		result = contracts.TimelineResponse{
+			CaseID:   item.ID,
+			State:    item.State,
+			Version:  item.Version,
+			Events:   events,
+			Timeline: timeline,
+		}
 		return nil
 	})
 	return result, err
@@ -146,6 +177,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		at := s.now()
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -153,12 +185,13 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			item.Nominal,
 			item.Tolerance,
 			input.Technician,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
-		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
+		before := item
+		if err := item.RecordMeasurement(measurement.Accepted, at); err != nil {
 			return err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
@@ -167,28 +200,31 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
-		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
+		kind := domain.EventMeasurementRejected
+		basis := "measurement exceeded tolerance and requires another measurement"
 		if measurement.Accepted {
-			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
+			kind = domain.EventMeasurementAccepted
+			basis = "measurement is within tolerance and ready for review"
 		}
-		event, err := domain.NewAuditEvent(
+		event, err := domain.NewCaseTransitionEvent(
 			m.NextID("event"),
-			"case",
-			item.ID,
 			item.ID,
 			kind,
 			measurement.Technician,
-			detail,
-			s.now(),
+			basis,
+			before.State,
+			item.State,
+			before.Version,
+			item.Version,
+			domain.RefMeasurement,
+			measurement.ID,
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return buildCaseView(m, item, &result)
 	})
 	return result, err
 }
@@ -201,33 +237,41 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if err := item.Reopen(s.now()); err != nil {
-			return err
-		}
-		if err := m.UpdateCase(item); err != nil {
-			return err
-		}
+		// Validate the requested action before touching state: an invalid or
+		// illegal reopen returns its error and the copy-on-write commit is
+		// discarded, so no event or timeline step is produced.
 		actor := strings.TrimSpace(input.Actor)
 		reason := strings.TrimSpace(input.Reason)
 		if actor == "" || reason == "" {
 			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
-		event, err := domain.NewAuditEvent(
+		before := item
+		at := s.now()
+		if err := item.Reopen(at); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		event, err := domain.NewCaseTransitionEvent(
 			m.NextID("event"),
-			"case",
 			item.ID,
-			item.ID,
-			"case_reopened",
+			domain.EventCaseReopened,
 			actor,
 			reason,
-			s.now(),
+			before.State,
+			item.State,
+			before.Version,
+			item.Version,
+			"",
+			"",
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return buildCaseView(m, item, &result)
 	})
 	return result, err
 }
@@ -247,7 +291,9 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
-		if err := item.Seal(s.now()); err != nil {
+		at := s.now()
+		before := item
+		if err := item.Seal(at); err != nil {
 			return err
 		}
 		seal, err := domain.NewEvidenceSeal(
@@ -257,7 +303,7 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
@@ -268,22 +314,25 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
-		event, err := domain.NewAuditEvent(
+		event, err := domain.NewCaseTransitionEvent(
 			m.NextID("event"),
-			"case",
 			item.ID,
-			item.ID,
-			"case_sealed",
+			domain.EventCaseSealed,
 			seal.Reviewer,
 			seal.Summary,
-			s.now(),
+			before.State,
+			item.State,
+			before.Version,
+			item.Version,
+			domain.RefEvidenceSeal,
+			seal.ID,
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		result = caseResponse(m, item)
-		return nil
+		return buildCaseView(m, item, &result)
 	})
 	return result, err
 }
@@ -303,26 +352,29 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 	return selected, found
 }
 
-func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
-	result := contracts.CaseResponse{
-		Case:         item,
-		Measurements: m.Measurements(item.ID),
-		Events:       m.Events(item.ID),
-	}
-	if seal, exists := m.Seal(item.ID); exists {
-		result.Seal = &seal
-	}
-	return result
+// caseReader exposes the read side shared by a mutation working copy and a
+// read snapshot, so both command and query paths project identically.
+type caseReader interface {
+	Measurements(caseID string) []domain.Measurement
+	Events(caseID string) []domain.AuditEvent
+	Seal(caseID string) (domain.EvidenceSeal, bool)
 }
 
-func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
-	result := contracts.CaseResponse{
+func buildCaseView(reader caseReader, item domain.VerificationCase, result *contracts.CaseResponse) error {
+	events := reader.Events(item.ID)
+	timeline, err := domain.BuildCaseTimeline(item, events)
+	if err != nil {
+		return err
+	}
+	view := contracts.CaseResponse{
 		Case:         item,
-		Measurements: snapshot.Measurements(item.ID),
-		Events:       snapshot.Events(item.ID),
+		Measurements: reader.Measurements(item.ID),
+		Events:       events,
+		Timeline:     timeline,
 	}
-	if seal, exists := snapshot.Seal(item.ID); exists {
-		result.Seal = &seal
+	if seal, exists := reader.Seal(item.ID); exists {
+		view.Seal = &seal
 	}
-	return result
+	*result = view
+	return nil
 }

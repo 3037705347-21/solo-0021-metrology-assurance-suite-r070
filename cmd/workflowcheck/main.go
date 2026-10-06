@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"case-state-timeline":      checkCaseStateTimeline,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +377,370 @@ func checkSealVerification() error {
 	return nil
 }
 
+type expectedStep struct {
+	action      string
+	actor       string
+	fromState   string
+	toState     string
+	fromVersion int
+	toVersion   int
+	refType     string
+}
+
+// checkCaseStateTimeline drives one case through rejection, reopen, acceptance
+// and sealing, injecting failed requests and a concurrent seal. It then proves
+// that the events endpoint presents a stable, chain-linked timeline that
+// matches the case detail endpoint.
+func checkCaseStateTimeline() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	// Capture the timeline right after opening: the first step is frozen and
+	// must remain byte-for-byte the same after later transitions.
+	openingEvents, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(openingEvents, http.StatusOK); err != nil {
+		return err
+	}
+	openingTimeline, err := nestedSlice(openingEvents.Body, "timeline")
+	if err != nil {
+		return err
+	}
+	if len(openingTimeline) != 1 {
+		return fmt.Errorf("opening timeline has %d steps, expected 1", len(openingTimeline))
+	}
+	firstSequence, err := nestedFloat(openingEvents.Body, "timeline", 0, "sequence")
+	if err != nil {
+		return err
+	}
+
+	// Out-of-tolerance measurement -> recheck_required, then a failed second
+	// measurement attempt must not create a step.
+	rejected, err := h.recordMeasurement(caseID, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusCreated); err != nil {
+		return err
+	}
+	rejectedMeasurementID, err := nestedStringAt(rejected.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+	invalidMeasurement, err := h.recordMeasurement(caseID, 25.0, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalidMeasurement, http.StatusConflict); err != nil {
+		return err
+	}
+
+	// Reopen, followed by a duplicate reopen and an invalid reopen, both of
+	// which must be rejected without producing steps.
+	reopened, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "measurement setup was replaced",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	duplicateReopen, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "duplicate request",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicateReopen, http.StatusConflict); err != nil {
+		return err
+	}
+	badReopen, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "",
+		"reason": "",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(badReopen, http.StatusBadRequest); err != nil {
+		return err
+	}
+
+	// In-tolerance re-measurement -> review_ready, then an illegal seal from a
+	// measurement request surface: try sealing with wrong flow first by using
+	// the correct seal but racing a duplicate.
+	accepted, err := h.recordMeasurement(caseID, 25.1, "Ning")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(accepted, http.StatusCreated); err != nil {
+		return err
+	}
+	acceptedMeasurementID, err := nestedStringAt(accepted.Body, "measurements", 1, "id")
+	if err != nil {
+		return err
+	}
+
+	type sealOutcome struct {
+		response apiResponse
+		err      error
+	}
+	sealResults := make(chan sealOutcome, 2)
+	var sealWait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		sealWait.Add(1)
+		go func(index int) {
+			defer sealWait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+				"reviewer": fmt.Sprintf("Reviewer-%d", index+1),
+				"summary":  "accepted measurement sealed for review",
+			})
+			sealResults <- sealOutcome{response: response, err: err}
+		}(index)
+	}
+	sealWait.Wait()
+	close(sealResults)
+	sealSuccesses, sealConflicts := 0, 0
+	for item := range sealResults {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			sealSuccesses++
+		case http.StatusConflict:
+			sealConflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent seal status %d", item.response.Status)
+		}
+	}
+	if sealSuccesses != 1 || sealConflicts != 1 {
+		return fmt.Errorf("concurrent seal outcomes: %d success, %d conflict", sealSuccesses, sealConflicts)
+	}
+
+	// Further mutations on the sealed case must fail and leave no steps.
+	lateMeasurement, err := h.recordMeasurement(caseID, 25.0, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(lateMeasurement, http.StatusConflict); err != nil {
+		return err
+	}
+	lateReopen, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "late request after seal",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(lateReopen, http.StatusConflict); err != nil {
+		return err
+	}
+
+	caseView, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(caseView, http.StatusOK); err != nil {
+		return err
+	}
+	eventsView, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(eventsView, http.StatusOK); err != nil {
+		return err
+	}
+
+	// Header and timeline of the events endpoint must match the case detail.
+	headerState, err := nestedString(eventsView.Body, "state")
+	if err != nil {
+		return err
+	}
+	caseState, err := nestedString(caseView.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if headerState != caseState || headerState != "sealed" {
+		return fmt.Errorf("events header state %q does not match case state %q", headerState, caseState)
+	}
+	headerVersion, err := nestedFloat(eventsView.Body, "version")
+	if err != nil {
+		return err
+	}
+	caseVersion, err := nestedFloat(caseView.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	if headerVersion != caseVersion || headerVersion != 5 {
+		return fmt.Errorf("events header version %v does not match case version %v", headerVersion, caseVersion)
+	}
+	if !reflect.DeepEqual(eventsView.Body["timeline"], caseView.Body["timeline"]) {
+		return errors.New("case detail and events endpoints report different timelines")
+	}
+
+	timeline, err := nestedSlice(eventsView.Body, "timeline")
+	if err != nil {
+		return err
+	}
+	// Five effective transitions: open, reject, reopen, accept, seal. Every
+	// failed request above must be absent.
+	if len(timeline) != 5 {
+		return fmt.Errorf("timeline has %d steps after full lifecycle, expected 5", len(timeline))
+	}
+
+	// History never reorders: the opening step is unchanged since first read.
+	if !reflect.DeepEqual(timeline[0], openingTimeline[0]) {
+		return errors.New("opening timeline step was rewritten by later events")
+	}
+
+	expected := []expectedStep{
+		{action: "case_opened", actor: "Qiao", fromState: "", toState: "awaiting_measurement", fromVersion: 0, toVersion: 1},
+		{action: "measurement_rejected", actor: "Rui", fromState: "awaiting_measurement", toState: "recheck_required", fromVersion: 1, toVersion: 2, refType: "measurement"},
+		{action: "case_reopened", actor: "Lin", fromState: "recheck_required", toState: "awaiting_measurement", fromVersion: 2, toVersion: 3},
+		{action: "measurement_accepted", actor: "Ning", fromState: "awaiting_measurement", toState: "review_ready", fromVersion: 3, toVersion: 4, refType: "measurement"},
+		{action: "case_sealed", actor: "", fromState: "review_ready", toState: "sealed", fromVersion: 4, toVersion: 5, refType: "evidence_seal"},
+	}
+	var previousSequence float64
+	for index, want := range expected {
+		step, ok := timeline[index].(map[string]any)
+		if !ok {
+			return fmt.Errorf("step %d is not an object", index+1)
+		}
+		if got := stepNumber(step); got != index+1 {
+			return fmt.Errorf("step %d has step number %d", index+1, got)
+		}
+		if got, _ := step["action"].(string); got != want.action {
+			return fmt.Errorf("step %d action = %q, expected %q", index+1, got, want.action)
+		}
+		if want.actor != "" {
+			if got, _ := step["actor"].(string); got != want.actor {
+				return fmt.Errorf("step %d actor = %q, expected %q", index+1, got, want.actor)
+			}
+		} else if actor, _ := step["actor"].(string); actor == "" {
+			return fmt.Errorf("step %d seal actor is empty", index+1)
+		}
+		if got, _ := step["from_state"].(string); got != want.fromState {
+			return fmt.Errorf("step %d from_state = %q, expected %q", index+1, got, want.fromState)
+		}
+		if got, _ := step["to_state"].(string); got != want.toState {
+			return fmt.Errorf("step %d to_state = %q, expected %q", index+1, got, want.toState)
+		}
+		if got := int(optionalNumber(step, "from_version")); got != want.fromVersion {
+			return fmt.Errorf("step %d from_version = %d, expected %d", index+1, got, want.fromVersion)
+		}
+		if got := int(numberField(step, "to_version")); got != want.toVersion {
+			return fmt.Errorf("step %d to_version = %d, expected %d", index+1, got, want.toVersion)
+		}
+		sequence, ok := step["sequence"].(float64)
+		if !ok || sequence <= 0 {
+			return fmt.Errorf("step %d has no commit sequence", index+1)
+		}
+		if index == 0 {
+			if sequence != firstSequence {
+				return fmt.Errorf("opening sequence changed: %v -> %v", firstSequence, sequence)
+			}
+		} else if sequence <= previousSequence {
+			return fmt.Errorf("step %d sequence %v does not strictly follow %v", index+1, sequence, previousSequence)
+		}
+		previousSequence = sequence
+
+		switch index {
+		case 1:
+			if refID, _ := step["ref_id"].(string); refID != rejectedMeasurementID {
+				return fmt.Errorf("reject step references %q, expected measurement %s", refID, rejectedMeasurementID)
+			}
+		case 3:
+			if refID, _ := step["ref_id"].(string); refID != acceptedMeasurementID {
+				return fmt.Errorf("accept step references %q, expected measurement %s", refID, acceptedMeasurementID)
+			}
+		case 4:
+			sealID, err := nestedString(caseView.Body, "seal", "id")
+			if err != nil {
+				return err
+			}
+			if refID, _ := step["ref_id"].(string); refID != sealID {
+				return fmt.Errorf("seal step references %q, expected evidence seal %s", refID, sealID)
+			}
+		}
+		if got, _ := step["ref_type"].(string); got != want.refType {
+			return fmt.Errorf("step %d ref_type = %q, expected %q", index+1, got, want.refType)
+		}
+		if basis, _ := step["basis"].(string); basis == "" {
+			return fmt.Errorf("step %d has no basis", index+1)
+		}
+	}
+
+	// The raw events list stays append-ordered and has one event per step.
+	rawEvents, err := nestedSlice(eventsView.Body, "events")
+	if err != nil {
+		return err
+	}
+	if len(rawEvents) != 5 {
+		return fmt.Errorf("raw events length = %d, expected 5", len(rawEvents))
+	}
+
+	// A not-found case keeps the stable error contract on both read entries.
+	missing, err := h.request(http.MethodGet, "/cases/case-9999/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusNotFound); err != nil {
+		return err
+	}
+	return expectErrorCode(missing, "not_found")
+}
+
+func stepNumber(step map[string]any) int {
+	return int(numberField(step, "step"))
+}
+
+func numberField(step map[string]any, key string) float64 {
+	value, ok := step[key].(float64)
+	if !ok {
+		return -1
+	}
+	return value
+}
+
+// optionalNumber treats an omitted key as zero, matching omitempty on the
+// opening boundary fields (step 1 has no predecessor version/state).
+func optionalNumber(step map[string]any, key string) float64 {
+	if value, ok := step[key].(float64); ok {
+		return value
+	}
+	return 0
+}
+
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -535,6 +901,18 @@ func nestedString(root map[string]any, path ...string) (string, error) {
 	text, ok := value.(string)
 	if !ok {
 		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+	}
+	return text, nil
+}
+
+func nestedStringAt(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }

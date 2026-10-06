@@ -9,6 +9,10 @@ var (
 	ErrActiveCaseExists   = errors.New("device already has an unfinished case")
 	ErrStateConflict      = errors.New("resource state conflict")
 	ErrSealAlreadyCreated = errors.New("case already has an evidence seal")
+	// ErrTimelineIntegrity means the committed case state and its event chain
+	// disagree. It is a server-side corruption signal rather than a client
+	// mistake and is therefore intentionally absent from IsKnownError.
+	ErrTimelineIntegrity = errors.New("case timeline integrity failure")
 )
 
 func IsKnownError(err error) bool {

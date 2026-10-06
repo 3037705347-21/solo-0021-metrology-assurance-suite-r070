@@ -189,9 +189,18 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
-func (m *Mutation) AppendEvent(item domain.AuditEvent) {
+// AppendEvent commits an audit event at the end of the append-only log and
+// assigns its repository-wide, monotonically increasing sequence. Timelines
+// order by this sequence, so callers must not assume anything from timestamps
+// or slice positions elsewhere.
+func (m *Mutation) AppendEvent(item domain.AuditEvent) domain.AuditEvent {
+	m.counters[eventSequenceCounter]++
+	item.Sequence = int64(m.counters[eventSequenceCounter])
 	m.events = append(m.events, item)
+	return item
 }
+
+const eventSequenceCounter = "event_sequence"
 
 func (m *Mutation) Events(caseID string) []domain.AuditEvent {
 	var result []domain.AuditEvent

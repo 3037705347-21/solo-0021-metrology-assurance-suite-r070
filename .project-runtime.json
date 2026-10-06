@@ -5,7 +5,10 @@
     ".go"
   ],
   "build_command": "go build ./...",
-  "testing": "deferred",
+  "testing": {
+    "unit": "go test ./...",
+    "workflow_checks": "go run ./cmd/workflowcheck --workflow <id>"
+  },
   "service": {
     "run_command": "go run ./cmd/metrology-service --addr 127.0.0.1:18121",
     "health_url": "http://127.0.0.1:18121/healthz"
@@ -30,6 +33,10 @@
     {
       "workflow_id": "seal-verification",
       "command": "go run ./cmd/workflowcheck --workflow seal-verification"
+    },
+    {
+      "workflow_id": "case-state-timeline",
+      "command": "go run ./cmd/workflowcheck --workflow case-state-timeline"
     }
   ]
 }
